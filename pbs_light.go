@@ -30,6 +30,7 @@ import (
 	"syscall"
 
 	"crypto/tls"
+	"errors"
 	"github.com/prebid/prebid-server/adapters"
 	"github.com/prebid/prebid-server/adapters/appnexus"
 	"github.com/prebid/prebid-server/adapters/conversant"
@@ -39,6 +40,7 @@ import (
 	"github.com/prebid/prebid-server/adapters/pubmatic"
 	"github.com/prebid/prebid-server/adapters/pulsepoint"
 	"github.com/prebid/prebid-server/adapters/rubicon"
+	analytics2 "github.com/prebid/prebid-server/analytics"
 	"github.com/prebid/prebid-server/cache"
 	"github.com/prebid/prebid-server/cache/dummycache"
 	"github.com/prebid/prebid-server/cache/filecache"
@@ -189,11 +191,28 @@ type cookieSyncResponse struct {
 	BidderStatus []*pbs.PBSBidder `json:"bidder_status"`
 }
 
+var atics analytics2.Module
+
 func cookieSync(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	var cso analytics2.CookieSyncObject
+	if atics != nil {
+		cso = analytics2.CookieSyncObject{
+			Type:   analytics2.COOKIE_SYNC,
+			Status: http.StatusOK,
+			Error:  make([]error, 0),
+		}
+	}
+
 	mCookieSyncMeter.Mark(1)
 	userSyncCookie := pbs.ParsePBSCookieFromRequest(r, &(hostCookieSettings.OptOutCookie))
 	if !userSyncCookie.AllowSyncs() {
+
 		http.Error(w, "User has opted out", http.StatusUnauthorized)
+		if atics != nil {
+			cso.Status = http.StatusUnauthorized
+			cso.Error = append(cso.Error, errors.New("user has opted out"))
+			atics.LogToModule(&cso)
+		}
 		return
 	}
 
@@ -205,8 +224,21 @@ func cookieSync(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		if glog.V(2) {
 			glog.Infof("Failed to parse /cookie_sync request body: %v", err)
 		}
+		if atics != nil {
+			if c, err := json.Marshal(csReq); err == nil {
+				cso.Request = string(c)
+			} else {
+				fmt.Printf("Cookie sync request marshal error %v", err)
+			}
+			cso.Status = http.StatusBadRequest
+			atics.LogToModule(&cso)
+		}
 		http.Error(w, "JSON parse failed", http.StatusBadRequest)
 		return
+	}
+
+	if c, err := json.Marshal(csReq); err == nil && atics != nil {
+		cso.Request = string(c)
 	}
 
 	csResp := cookieSyncResponse{
@@ -233,10 +265,16 @@ func cookieSync(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		}
 	}
 
+	if cs, err := json.Marshal(csResp); err == nil && atics != nil {
+		cso.Response = string(cs)
+		atics.LogToModule(&cso)
+	}
+
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	//enc.SetIndent("", "  ")
 	enc.Encode(csResp)
+
 }
 
 type auctionDeps struct {
@@ -792,6 +830,10 @@ func serve(cfg *config.Configuration) error {
 
 	setupExchanges(cfg)
 
+	if cfg.EnableTransactionLogging {
+		atics = analytics2.SetupAnalytics(cfg)
+	}
+
 	if cfg.Metrics.Host != "" {
 		go influxdb.InfluxDB(
 			metricsRegistry,      // metrics registry
@@ -841,7 +883,7 @@ func serve(cfg *config.Configuration) error {
 				TLSClientConfig:     &tls.Config{RootCAs: ssl.GetRootCAPool()},
 			},
 		},
-		cfg)
+		cfg, &atics)
 
 	byId, err := NewFetcher(&(cfg.StoredRequests))
 	if err != nil {
@@ -878,6 +920,7 @@ func serve(cfg *config.Configuration) error {
 		ExternalUrl:        cfg.ExternalURL,
 		RecaptchaSecret:    cfg.RecaptchaSecret,
 		Metrics:            metricsRegistry,
+		Analytics:          &atics,
 	}
 
 	router.GET("/getuids", userSyncDeps.GetUIDs)
