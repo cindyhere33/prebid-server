@@ -3,6 +3,8 @@ package pbs
 import (
 	"encoding/base64"
 	"encoding/json"
+	"github.com/prebid/prebid-server/config"
+	"github.com/prebid/prebid-server/openrtb_ext"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -46,6 +48,32 @@ func TestCookieWithData(t *testing.T) {
 		birthday: timestamp(),
 	}
 	ensureConsistency(t, cookie)
+}
+
+func TestBidderNameGets(t *testing.T) {
+	cookie := &PBSCookie{
+		uids: map[string]uidWithExpiry{
+			"adnxs":   newTempId("123"),
+			"rubicon": newTempId("456"),
+		},
+		optOut:   false,
+		birthday: timestamp(),
+	}
+	id, exists := cookie.GetId(openrtb_ext.BidderAppnexus)
+	if !exists {
+		t.Errorf("Cookie missing expected Appnexus ID")
+	}
+	if id != "123" {
+		t.Errorf("Bad appnexus id. Expected %s, got %s", "123", id)
+	}
+
+	id, exists = cookie.GetId(openrtb_ext.BidderRubicon)
+	if !exists {
+		t.Errorf("Cookie missing expected Rubicon ID")
+	}
+	if id != "456" {
+		t.Errorf("Bad rubicon id. Expected %s, got %s", "456", id)
+	}
 }
 
 func TestRejectAudienceNetworkCookie(t *testing.T) {
@@ -124,7 +152,7 @@ func TestParseNilSyncMap(t *testing.T) {
 	cookieJSON := "{\"bday\":123,\"optout\":true}"
 	cookieData := base64.URLEncoding.EncodeToString([]byte(cookieJSON))
 	raw := http.Cookie{
-		Name:  COOKIE_NAME,
+		Name:  UID_COOKIE_NAME,
 		Value: cookieData,
 	}
 	parsed := ParsePBSCookie(&raw)
@@ -208,6 +236,15 @@ func TestNilCookie(t *testing.T) {
 	if isLive {
 		t.Error("nil cookies shouldn't report live UID mappings.")
 	}
+
+	uid, hadUID = nilCookie.GetId("anything")
+
+	if uid != "" {
+		t.Error("nil cookies should return empty strings for the UID.")
+	}
+	if hadUID {
+		t.Error("nil cookies shouldn't claim to have a UID mapping.")
+	}
 }
 
 func ensureEmptyMap(t *testing.T, cookie *PBSCookie) {
@@ -289,7 +326,7 @@ func writeThenRead(cookie *PBSCookie) *PBSCookie {
 	header := http.Header{}
 	header.Add("Cookie", writtenCookie)
 	request := http.Request{Header: header}
-	return ParsePBSCookieFromRequest(&request)
+	return ParsePBSCookieFromRequest(&request, &config.Cookie{})
 }
 
 func newTempId(uid string) uidWithExpiry {

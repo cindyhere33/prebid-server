@@ -17,7 +17,17 @@ import (
 
 	"github.com/mxmCherry/openrtb"
 	"github.com/prebid/prebid-server/adapters"
+	"github.com/prebid/prebid-server/adapters/adapterstest"
+	"github.com/prebid/prebid-server/config"
 )
+
+func TestJsonSamples(t *testing.T) {
+	adapterstest.RunJSONBidderTest(t, "appnexustest", new(AppNexusAdapter))
+}
+
+// ----------------------------------------------------------------------------
+// Code below this line tests the legacy, non-openrtb code flow. It can be deleted after we
+// clean up the existing code and make everything openrtb.
 
 type anTagInfo struct {
 	code              string
@@ -327,7 +337,7 @@ func TestAppNexusBasicResponse(t *testing.T) {
 	req.Header.Add("User-Agent", andata.deviceUA)
 	req.Header.Add("X-Real-IP", andata.deviceIP)
 
-	pc := pbs.ParsePBSCookieFromRequest(req)
+	pc := pbs.ParsePBSCookieFromRequest(req, &config.Cookie{})
 	pc.TrySync("adnxs", andata.buyerUID)
 	fakewriter := httptest.NewRecorder()
 	pc.SetCookieOnResponse(fakewriter, "")
@@ -401,5 +411,4 @@ func TestAppNexusUserSyncInfo(t *testing.T) {
 	if an.usersyncInfo.SupportCORS != false {
 		t.Fatalf("should have been false")
 	}
-
 }

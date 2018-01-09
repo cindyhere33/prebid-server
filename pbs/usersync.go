@@ -13,13 +13,15 @@ import (
 	"errors"
 	"github.com/golang/glog"
 	"github.com/julienschmidt/httprouter"
+	"github.com/prebid/prebid-server/config"
+	"github.com/prebid/prebid-server/openrtb_ext"
 	"github.com/prebid/prebid-server/ssl"
 	"github.com/rcrowley/go-metrics"
 )
 
 // Recaptcha code from https://github.com/haisum/recaptcha/blob/master/recaptcha.go
 const RECAPTCHA_URL = "https://www.google.com/recaptcha/api/siteverify"
-const COOKIE_NAME = "uids"
+const UID_COOKIE_NAME = "uids"
 
 // DEFAULT_TTL is the default amount of time which a cookie is considered valid.
 const DEFAULT_TTL = 14 * 24 * time.Hour
@@ -34,6 +36,14 @@ const (
 	USERSYNC_SUCCESS     = "usersync.%s.sets"
 )
 
+// bidderToFamilyNames maps the BidderName to Adapter.FamilyName() for the early adapters.
+// If a mapping isn't listed here, then we assume that the two are the same.
+var bidderToFamilyNames = map[openrtb_ext.BidderName]string{
+	openrtb_ext.BidderAppnexus: "adnxs",
+	openrtb_ext.BidderFacebook: "audienceNetwork",
+	openrtb_ext.BidderIndex:    "indexExchange",
+}
+
 // PBSCookie is the cookie used in Prebid Server.
 //
 // To get an instance of this from a request, use ParsePBSCookieFromRequest.
@@ -45,11 +55,12 @@ type PBSCookie struct {
 }
 
 type HostCookieSettings struct {
-	Domain     string
-	Family     string
-	CookieName string
-	OptOutURL  string
-	OptInURL   string
+	Domain       string
+	Family       string
+	CookieName   string
+	OptOutURL    string
+	OptInURL     string
+	OptOutCookie config.Cookie
 }
 
 // uidWithExpiry bundles the UID with an Expiration date.
@@ -64,27 +75,32 @@ type uidWithExpiry struct {
 type UserSyncDeps struct {
 	ExternalUrl        string
 	RecaptchaSecret    string
-	OptOutUrl          string
-	OptInUrl           string
 	HostCookieSettings *HostCookieSettings
 	Metrics            metrics.Registry
 }
 
 // ParsePBSCookieFromRequest parses the UserSyncMap from an HTTP Request.
-func ParsePBSCookieFromRequest(r *http.Request) *PBSCookie {
-	cookie, err := r.Cookie(COOKIE_NAME)
-	if err != nil {
+func ParsePBSCookieFromRequest(r *http.Request, configuredOptoutCookie *config.Cookie) *PBSCookie {
+	if configuredOptoutCookie.Name != "" {
+		optOutCookie, err1 := r.Cookie(configuredOptoutCookie.Name)
+		if err1 == nil && optOutCookie.Value == configuredOptoutCookie.Value {
+			pc := NewPBSCookie()
+			pc.SetPreference(false)
+			return pc
+		}
+	}
+	uidCookie, err2 := r.Cookie(UID_COOKIE_NAME)
+	if err2 != nil {
 		return NewPBSCookie()
 	}
-
-	return ParsePBSCookie(cookie)
+	return ParsePBSCookie(uidCookie)
 }
 
 // ParsePBSCookie parses the UserSync cookie from a raw HTTP cookie.
-func ParsePBSCookie(cookie *http.Cookie) *PBSCookie {
+func ParsePBSCookie(uidCookie *http.Cookie) *PBSCookie {
 	pc := NewPBSCookie()
 
-	j, err := base64.URLEncoding.DecodeString(cookie.Value)
+	j, err := base64.URLEncoding.DecodeString(uidCookie.Value)
 	if err != nil {
 		// corrupted cookie; we should reset
 		return pc
@@ -106,11 +122,7 @@ func NewPBSCookie() *PBSCookie {
 
 // AllowSyncs is true if the user lets bidders sync cookies, and false otherwise.
 func (cookie *PBSCookie) AllowSyncs() bool {
-	if cookie == nil {
-		return false
-	} else {
-		return !cookie.optOut
-	}
+	return cookie != nil && !cookie.optOut
 }
 
 // SetPreference is used to change whether or not we're allowed to sync cookies for this user.
@@ -129,7 +141,7 @@ func (cookie *PBSCookie) ToHTTPCookie() *http.Cookie {
 	b64 := base64.URLEncoding.EncodeToString(j)
 
 	return &http.Cookie{
-		Name:    COOKIE_NAME,
+		Name:    UID_COOKIE_NAME,
 		Value:   b64,
 		Expires: time.Now().Add(180 * 24 * time.Hour),
 	}
@@ -148,6 +160,16 @@ func (cookie *PBSCookie) GetUID(familyName string) (string, bool, bool) {
 		}
 	}
 	return "", false, false
+}
+
+// GetId wraps GetUID, letting callers fetch the ID given an OpenRTB BidderName.
+func (cookie *PBSCookie) GetId(bidderName openrtb_ext.BidderName) (id string, exists bool) {
+	if familyName, ok := bidderToFamilyNames[bidderName]; ok {
+		id, exists, _ = cookie.GetUID(familyName)
+	} else {
+		id, exists, _ = cookie.GetUID(string(bidderName))
+	}
+	return
 }
 
 // SetCookieOnResponse is a shortcut for "ToHTTPCookie(); cookie.setDomain(domain); setCookie(w, cookie)"
@@ -273,7 +295,7 @@ func (cookie *PBSCookie) UnmarshalJSON(b []byte) error {
 }
 
 func (deps *UserSyncDeps) GetUIDs(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	pc := ParsePBSCookieFromRequest(r)
+	pc := ParsePBSCookieFromRequest(r, &deps.HostCookieSettings.OptOutCookie)
 	pc.SetCookieOnResponse(w, deps.HostCookieSettings.Domain)
 	json.NewEncoder(w).Encode(pc)
 	return
@@ -294,7 +316,7 @@ func getRawQueryMap(query string) map[string]string {
 }
 
 func (deps *UserSyncDeps) SetUID(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	pc := ParsePBSCookieFromRequest(r)
+	pc := ParsePBSCookieFromRequest(r, &deps.HostCookieSettings.OptOutCookie)
 	if !pc.AllowSyncs() {
 		w.WriteHeader(http.StatusUnauthorized)
 		metrics.GetOrRegisterMeter(USERSYNC_OPT_OUT, deps.Metrics).Mark(1)
@@ -372,14 +394,14 @@ func (deps *UserSyncDeps) OptOut(w http.ResponseWriter, r *http.Request, _ httpr
 		return
 	}
 
-	pc := ParsePBSCookieFromRequest(r)
+	pc := ParsePBSCookieFromRequest(r, &deps.HostCookieSettings.OptOutCookie)
 	pc.SetPreference(optout == "")
 
 	pc.SetCookieOnResponse(w, deps.HostCookieSettings.Domain)
 	if optout == "" {
-		http.Redirect(w, r, deps.OptInUrl, 301)
+		http.Redirect(w, r, deps.HostCookieSettings.OptInURL, 301)
 	} else {
-		http.Redirect(w, r, deps.OptOutUrl, 301)
+		http.Redirect(w, r, deps.HostCookieSettings.OptOutURL, 301)
 	}
 }
 
